@@ -330,8 +330,19 @@ class LiveTracker:
             company, raw_symbol, isin, notif_date, order_type,
         )
 
+        # ── Market hours guard: only process 9:15 – 15:20 IST ───────────────
+        now = datetime.now(IST)
+        market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=20, second=0, microsecond=0)
+        if not (market_open <= now <= market_close):
+            log.info(
+                "Notification for %s received outside market hours (%s IST) — ignoring",
+                company, now.strftime("%H:%M"),
+            )
+            return
+
         # ── Date guard: skip anything not from today ──────────────────────────
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        today_str = now.strftime("%Y-%m-%d")
         if notif_date and notif_date != today_str:
             log.info(
                 "Skipping old notification for %s (notif_date=%s, today=%s)",
@@ -448,15 +459,29 @@ class LiveTracker:
     # ── Market close force-exit ───────────────────────────────────────────────
 
     def force_exit_all(self, reason: str = "MARKET_CLOSE") -> None:
-        """Exit all currently ENTERED trades at current market price."""
+        """Exit all ENTERED trades and expire all WAITING_ENTRY trades at market close."""
         with self._trades_lock:
-            active = [t for t in self._trades.values() if t.status == ENTERED]
+            active  = [t for t in self._trades.values() if t.status == ENTERED]
+            waiting = [t for t in self._trades.values() if t.status == WAITING_ENTRY]
+
+        # Expire stocks that never triggered entry
+        for state in waiting:
+            with state._lock:
+                if state.status == WAITING_ENTRY:
+                    state.status = EXITED
+            database.update_trade(state.trade_id, {
+                "status":      EXITED,
+                "exit_reason": "EXPIRED_NO_ENTRY",
+                "exit_time":   datetime.now(IST).isoformat(),
+            })
+            log.info("[%s] EXPIRED — never triggered entry before close", state.fyers_symbol)
 
         if not active:
-            log.info("force_exit_all: no active trades to exit")
+            log.info("force_exit_all: no entered trades to exit (%d expired)", len(waiting))
             return
 
-        log.info("force_exit_all: exiting %d trade(s) — reason=%s", len(active), reason)
+        log.info("force_exit_all: exiting %d trade(s), expiring %d waiting — reason=%s",
+                 len(active), len(waiting), reason)
         for state in active:
             ltp = self._fetch_ltp(state.fyers_symbol) or state.last_ltp or state.entry_price
             if ltp:

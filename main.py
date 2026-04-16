@@ -71,7 +71,8 @@ def _market_close_watcher(tracker: LiveTracker) -> None:
                 telegram_manager.send_system(
                     f"Market closed (15:25 IST).\n"
                     f"Trades today → entered: {summary['entered']}  "
-                    f"exited: {summary['exited']}  skip: {summary['skip']}"
+                    f"exited: {summary['exited']}  "
+                    f"expired: {summary['waiting']}  skip: {summary['skip']}"
                 )
         else:
             triggered = False  # reset for next day if process stays up overnight
