@@ -33,7 +33,6 @@ Usage:
 import json
 import logging
 import signal
-import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -203,8 +202,7 @@ def main() -> None:
     def _shutdown(sig, frame):
         log.info("Shutdown signal received — stopping ...")
         tracker.stop()
-        server.shutdown()
-        sys.exit(0)
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
