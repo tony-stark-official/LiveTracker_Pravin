@@ -67,9 +67,22 @@ def send_tracking(
     direction: str,
     score: int,
     ref_price: float,
+    event_value_cr: float | None = None,
+    market_cap_cr: float | None = None,
+    order_impact_pct: float | None = None,
+    industry: str | None = None,
+    rsi: float | None = None,
+    note: str | None = None,
 ) -> None:
     emoji  = "🟢" if direction == "BUY" else "🔴"
     conv   = "HIGH" if score >= 70 else "NORMAL"
+    event_line  = f"🏷️ Event   : ₹{event_value_cr:.2f} Cr\n" if event_value_cr else ""
+    mcap_line   = f"💹 MCap    : ₹{market_cap_cr:.2f} Cr\n" if market_cap_cr else ""
+    ref_line    = f"💰 Ref Price  : ₹{ref_price:.2f}\n" if ref_price else ""
+    impact_line = f"🔥 Impact     : {order_impact_pct:.1f}% of MCap\n" if order_impact_pct else ""
+    sector_line = f"🏭 Industry   : {industry}\n" if industry else ""
+    rsi_line    = f"📉 RSI        : {rsi:.1f}\n" if rsi is not None else ""
+    note_line   = f"\n📅 <i>{note}</i>" if note else ""
     text = (
         f"{emoji} <b>TRACKING — {direction}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -77,10 +90,15 @@ def send_tracking(
         f"📌 Symbol  : <code>{fyers_symbol}</code>\n"
         f"🔖 ISIN    : <code>{isin}</code>\n"
         f"📋 Order   : <b>{order_type}</b>\n"
+        f"{event_line}"
+        f"{mcap_line}"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Score      : <b>{score}/100</b> ({conv})\n"
-        f"💰 Ref Price  : ₹{ref_price:.2f}\n"
-        "⏳ Waiting for entry trigger..."
+        f"{impact_line}"
+        f"{sector_line}"
+        f"{rsi_line}"
+        f"{ref_line}"
+        f"⏳ Waiting for entry trigger...{note_line}"
     )
     _send(text)
 
@@ -93,18 +111,26 @@ def send_entry(
     entry_price: float,
     tp: float,
     sl: float,
+    entry_time_str: str | None = None,
+    event_value_cr: float | None = None,
+    market_cap_cr: float | None = None,
 ) -> None:
     emoji = "📈" if direction == "BUY" else "📉"
     tp_pct = abs(tp - entry_price) / entry_price * 100
     sl_pct = abs(sl - entry_price) / entry_price * 100
+    event_line = f"🏷️ Event   : ₹{event_value_cr:.2f} Cr\n" if event_value_cr else ""
+    mcap_line  = f"💹 MCap    : ₹{market_cap_cr:.2f} Cr\n" if market_cap_cr else ""
+    time_tag   = f"  <i>({entry_time_str})</i>" if entry_time_str else ""
     text = (
         f"{emoji} <b>ENTERED — {direction}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>{company}</b>\n"
         f"📌 Symbol  : <code>{fyers_symbol}</code>\n"
         f"📋 Order   : <b>{order_type}</b>\n"
+        f"{event_line}"
+        f"{mcap_line}"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Entry   : ₹{entry_price:.2f}\n"
+        f"💵 Entry   : ₹{entry_price:.2f}{time_tag}\n"
         f"🎯 TP      : ₹{tp:.2f}  <i>(+{tp_pct:.1f}%)</i>\n"
         f"🛑 SL      : ₹{sl:.2f}  <i>(-{sl_pct:.1f}%)</i>"
     )

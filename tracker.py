@@ -66,16 +66,18 @@ class TradeState:
     status:       str = WAITING_ENTRY
 
     # Filled once we start receiving ticks
-    day_open:     float | None = None
-    entry_price:  float | None = None
-    entry_time:   datetime | None = None
-    entry_ts:     float = 0.0      # epoch seconds at entry (for elapsed-time checks)
-    tp:           float | None = None
-    sl:           float | None = None
-    hold_price:   float | None = None  # must reach by 5-min or exit
-    last_ltp:     float | None = None
-    notif_time:   datetime = field(default_factory=lambda: datetime.now(IST))
-    _lock:        threading.Lock = field(default_factory=threading.Lock, repr=False)
+    day_open:       float | None = None
+    entry_price:    float | None = None
+    entry_time:     datetime | None = None
+    entry_ts:       float = 0.0      # epoch seconds at entry (for elapsed-time checks)
+    tp:             float | None = None
+    sl:             float | None = None
+    hold_price:     float | None = None  # must reach by 5-min or exit
+    last_ltp:       float | None = None
+    notif_time:     datetime = field(default_factory=lambda: datetime.now(IST))
+    event_value_cr: float = 0.0
+    market_cap_cr:  float | None = None
+    _lock:          threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 # ─── Live tracker ─────────────────────────────────────────────────────────────
@@ -259,6 +261,9 @@ class LiveTracker:
         telegram_manager.send_entry(
             state.company_name, state.fyers_symbol, state.order_type,
             state.direction, ltp, state.tp, state.sl,
+            entry_time_str=state.entry_time.strftime("%H:%M:%S"),
+            event_value_cr=state.event_value_cr or None,
+            market_cap_cr=state.market_cap_cr,
         )
 
     def _exit(self, state: TradeState, ltp: float, reason: str) -> None:
@@ -330,18 +335,12 @@ class LiveTracker:
             company, raw_symbol, isin, notif_date, order_type,
         )
 
-        # ── Market hours guard: only process 9:15 – 15:20 IST ───────────────
+        # ── Market hours + date guards ────────────────────────────────────────
         now = datetime.now(IST)
         market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
         market_close = now.replace(hour=15, minute=20, second=0, microsecond=0)
-        if not (market_open <= now <= market_close):
-            log.info(
-                "Notification for %s received outside market hours (%s IST) — ignoring",
-                company, now.strftime("%H:%M"),
-            )
-            return
+        is_market_open = market_open <= now <= market_close
 
-        # ── Date guard: skip anything not from today ──────────────────────────
         today_str = now.strftime("%Y-%m-%d")
         if notif_date and notif_date != today_str:
             log.info(
@@ -378,6 +377,20 @@ class LiveTracker:
         if not row and raw_symbol:
             row = trendlyne_manager.get_by_symbol(raw_symbol)
         ev = _build_event_data(row, order_value_cr=order_val)
+
+        # ── Off-market gate: only track if event ≥ 50% of market cap ─────────
+        if not is_market_open:
+            mcap = ev.market_cap_cr
+            if not mcap or order_val < mcap * 0.5:
+                log.info(
+                    "OFF-MARKET SKIP [%s] %s: event ₹%.2f Cr < 50%% of mcap ₹%.2f Cr",
+                    fyers_sym, company, order_val, mcap or 0,
+                )
+                return
+            log.info(
+                "OFF-MARKET TRACK [%s] %s: event ₹%.2f Cr ≥ 50%% of mcap ₹%.2f Cr — queuing for next open",
+                fyers_sym, company, order_val, mcap,
+            )
 
         # ── Hard filter ───────────────────────────────────────────────────────
         skip, skip_reason = filter_event(ev)
@@ -429,6 +442,8 @@ class LiveTracker:
             direction=direction,
             score=score,
             notif_time=notif_dt,
+            event_value_cr=order_val,
+            market_cap_cr=ev.market_cap_cr,
         )
 
         with self._trades_lock:
@@ -447,13 +462,21 @@ class LiveTracker:
         # ── Fetch current quote for reference price in Telegram ───────────────
         ref_price = self._fetch_ltp(fyers_sym) or 0.0
 
+        off_market_note = "Off-Market — will track at next open" if not is_market_open else None
         log.info(
-            "TRACKING [%s] %s → %s | score=%d | ref=₹%.2f",
+            "TRACKING [%s] %s → %s | score=%d | ref=₹%.2f%s",
             fyers_sym, company, direction, score, ref_price,
+            " [OFF-MARKET]" if not is_market_open else "",
         )
         telegram_manager.send_tracking(
             company, fyers_sym, resolved_isin, order_type,
             direction, score, ref_price,
+            event_value_cr=order_val or None,
+            market_cap_cr=ev.market_cap_cr,
+            order_impact_pct=ev.order_impact_pct or None,
+            industry=ev.industry or None,
+            rsi=ev.rsi,
+            note=off_market_note,
         )
 
     # ── Market close force-exit ───────────────────────────────────────────────

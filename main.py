@@ -56,12 +56,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # ─── Force-exit scheduler ─────────────────────────────────────────────────────
 
 def _market_close_watcher(tracker: LiveTracker) -> None:
-    """Background thread: force-exits all entered trades at 15:25 IST."""
+    """Background thread: force-exits all entered trades at 15:25 IST on trading days."""
     CLOSE_HOUR, CLOSE_MIN = 15, 25
     triggered = False
     while True:
         now = datetime.now(IST)
-        if now.hour > CLOSE_HOUR or (now.hour == CLOSE_HOUR and now.minute >= CLOSE_MIN):
+        is_trading_day = now.weekday() < 5  # Mon–Fri only
+        if is_trading_day and (now.hour > CLOSE_HOUR or (now.hour == CLOSE_HOUR and now.minute >= CLOSE_MIN)):
             if not triggered:
                 log.info("─── Market close: force-exiting all active trades ───")
                 triggered = True
