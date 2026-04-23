@@ -16,14 +16,15 @@ from typing import Literal
 
 # ─── Live trade thresholds ────────────────────────────────────────────────────
 _LIVE_ENTRY_MIN  = 0.003   # +0.3% above day-open to trigger entry
-_LIVE_TP         = 0.020   # +2.0% take-profit
-_LIVE_SL         = 0.015   # -1.5% stop-loss
+_LIVE_TP         = 0.025   # +2.5% take-profit (HIGH conviction); NORMAL gets 80% = +2.0%
+_LIVE_SL         = 0.015   # -1.5% stop-loss (NORMAL conviction)
+_LIVE_SL_HIGH    = 0.010   # -1.0% stop-loss (HIGH conviction ≥70 → R:R = 2.5:1)
 _LIVE_HOLD_MIN   = 0.008   # must reach +0.8% by 5-min or exit
 _LIVE_FINAL_EXIT = 15      # hard exit after 15 minutes
 
 # ─── Score gates ──────────────────────────────────────────────────────────────
-_SCORE_ENTER    = 50   # minimum to enter any trade
-_SCORE_HIGH_CONV = 70  # high-conviction: full TP target; below: 80% TP
+_SCORE_ENTER    = 65   # minimum to enter any trade (raised from 50 — quality over quantity)
+_SCORE_HIGH_CONV = 70  # high-conviction: full TP + tighter SL; below: 80% TP + wider SL
 
 # ─── Hard filters ─────────────────────────────────────────────────────────────
 _MIN_MCAP_CR  = 100.0   # market cap in ₹ Crore
@@ -50,6 +51,8 @@ class EventData:
     vol_month_avg:    int | None = None
     price_15s_pct:    float | None = None  # % change from ref price at ~15s after event
     industry:         str = ""
+    alfa_reason:      bool = False          # True = earning call where AI flagged strong beat
+    profit_growth_qoq: float | None = None  # QoQ net profit growth % — financial results only
 
     order_impact_pct: float = field(init=False)
 
@@ -68,30 +71,32 @@ def filter_event(ev: EventData) -> tuple[bool, str]:
     Any True → do not trade.
     """
     # Skip order-size check when value is unknown (0)
+    # Allow small absolute order through if it's a high relative impact on the company
     if ev.order_value_cr > 0 and ev.order_value_cr < _MIN_ORDER_CR:
-        return True, f"ORDER_TOO_SMALL ({ev.order_value_cr:.2f} Cr)"
+        if ev.order_impact_pct < 10:
+            return True, f"ORDER_TOO_SMALL ({ev.order_value_cr:.2f} Cr, {ev.order_impact_pct:.1f}% impact)"
 
+    # Allow small-cap through when order impact is large — these are the hidden gems
     if ev.market_cap_cr is not None and ev.market_cap_cr < _MIN_MCAP_CR:
-        return True, f"MCAP_TOO_SMALL ({ev.market_cap_cr:.0f} Cr)"
+        if ev.order_impact_pct < 20:
+            return True, f"MCAP_TOO_SMALL ({ev.market_cap_cr:.0f} Cr, {ev.order_impact_pct:.1f}% impact)"
 
     vol = ev.vol_week_avg or ev.vol_month_avg or 0
-    if vol < _MIN_VOL_WEEK:
+    is_small_cap_gem = (
+        ev.market_cap_cr is not None
+        and ev.market_cap_cr < _MIN_MCAP_CR
+        and ev.order_impact_pct >= 20
+    )
+    is_qualitative_event = ev.alfa_reason or ev.profit_growth_qoq is not None
+    if vol < _MIN_VOL_WEEK and not is_small_cap_gem and not is_qualitative_event:
         return True, f"ILLIQUID (vol_week={vol})"
-
-    # Dead stock pattern: zero price movement on a small-cap
-    if ev.price_15s_pct == 0.0 and ev.market_cap_cr is not None and ev.market_cap_cr < 200:
-        return True, "DEAD_STOCK_PATTERN"
-
-    # Sell-off already in progress — don't chase
-    if ev.price_15s_pct is not None and ev.price_15s_pct < -1.5:
-        return True, f"SELL_OFF_IN_PROGRESS ({ev.price_15s_pct:.2f}%)"
 
     return False, ""
 
 
 # ─── Scorer ───────────────────────────────────────────────────────────────────
 
-def score_trade(ev: EventData) -> tuple[int, Literal["BUY", "SHORT", "SKIP"]]:
+def score_trade(ev: EventData) -> tuple[int, Literal["BUY", "SKIP"]]:
     """
     Score 0–100 and return (score, direction).
     Live-only: starts at 30 (same-day 94% win rate premium baked in).
@@ -102,15 +107,20 @@ def score_trade(ev: EventData) -> tuple[int, Literal["BUY", "SHORT", "SKIP"]]:
     if rsi is not None:
         if 55 <= rsi <= 72:
             score += 20   # ideal momentum zone
-        elif 45 <= rsi < 55 or 72 < rsi <= 76:
-            score += 10
+        elif 72 < rsi <= 76:
+            score += 10   # nearing overbought — caution
+        elif 45 <= rsi < 55:
+            score += 5    # neutral build — reduced reward vs ideal zone
         elif rsi > 76:
             score -= 10   # overbought — sell-off risk
+        # rsi < 45: 0 points — downtrend, no reward for a momentum buy
 
     wk = ev.week_chg_pct
     if wk is not None:
-        if wk < 10:
-            score += 15
+        if wk < -5:
+            score -= 5    # declining trend on the week — negative signal
+        elif wk < 10:
+            score += 15   # fresh/flat: hasn't run up yet
         elif wk < 20:
             score += 10
         elif wk < 30:
@@ -132,34 +142,27 @@ def score_trade(ev: EventData) -> tuple[int, Literal["BUY", "SHORT", "SKIP"]]:
     elif vol >= 15_000:
         score += 5
 
-    p15 = ev.price_15s_pct
-    if p15 is not None:
-        if p15 > 0.5:
-            score += 10   # price already moving: momentum confirmation
-        elif p15 > 0.0:
-            score += 5
-        elif p15 < -0.5:
-            score -= 20   # sell-off started — abort
-
     day = ev.day_chg_pct
-    if day is not None and day >= 1.0:
-        score += 5
+    if day is not None:
+        if day >= 1.0:
+            score += 5    # already moving positively today
+        elif day < 0:
+            score -= 5    # declining on the day — momentum not confirmed
+
+    # Earning call: AI-flagged strong beat (qualitative signal, no order value)
+    if ev.alfa_reason:
+        score += 30   # replaces order_impact scoring for this event type
+
+    # Financial result: QoQ net profit growth momentum
+    if ev.profit_growth_qoq is not None:
+        if ev.profit_growth_qoq > 200:
+            score += 20   # massive growth or deep turnaround — very strong signal
+        elif ev.profit_growth_qoq > 50:
+            score += 10   # solid growth
+        elif ev.profit_growth_qoq < 0:
+            score -= 15   # declining profits — don't chase a bounce
 
     score = max(0, min(100, score))
-
-    # ── Short signal ─────────────────────────────────────────────────────────
-    short_score = 0
-    if rsi is not None and rsi > 70:
-        short_score += 20
-    if wk is not None and wk > 25:
-        short_score += 15
-    if p15 is not None and p15 < -0.5:
-        short_score += 20
-    if ev.order_value_cr >= 200:
-        short_score += 10
-
-    if short_score >= 50 and score < _SCORE_ENTER:
-        return short_score, "SHORT"
 
     if score >= _SCORE_ENTER:
         return score, "BUY"

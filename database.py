@@ -99,6 +99,20 @@ def get_today_trades(date_str: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def flush_stale_entered_trades(exit_time: str) -> int:
+    """
+    On startup: close any ENTERED trades left over from a previous crash.
+    Marks them EXITED with exit_reason=SYSTEM_RESTART so they don't float forever.
+    Returns the count of rows updated.
+    """
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE live_trades SET status='EXITED', exit_reason='SYSTEM_RESTART', exit_time=? WHERE status='ENTERED'",
+            (exit_time,),
+        )
+        return cur.rowcount
+
+
 def get_active_trades() -> list[dict]:
     """Return all trades that are not yet EXITED or SKIP (for recovery on restart)."""
     with _conn() as conn:

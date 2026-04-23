@@ -22,13 +22,14 @@ from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
 from LiveTrader import database, telegram_manager, trendlyne_manager, symbol_master
-from LiveTrader.config import FYERS_CLIENT_ID, FYERS_ACCESS_TOKEN, FYERS_LOG_PATH
+from LiveTrader.config import FYERS_LOG_PATH
 from LiveTrader.strategy_engine import (
     EventData,
     _LIVE_ENTRY_MIN,
     _LIVE_FINAL_EXIT,
     _LIVE_HOLD_MIN,
     _LIVE_SL,
+    _LIVE_SL_HIGH,
     _LIVE_TP,
     _SCORE_HIGH_CONV,
     filter_event,
@@ -61,7 +62,7 @@ class TradeState:
     company_name: str
     raw_symbol:   str
     order_type:   str
-    direction:    str       # BUY | SHORT
+    direction:    str       # always BUY
     score:        int
     status:       str = WAITING_ENTRY
 
@@ -75,9 +76,12 @@ class TradeState:
     hold_price:     float | None = None  # must reach by 5-min or exit
     last_ltp:       float | None = None
     notif_time:     datetime = field(default_factory=lambda: datetime.now(IST))
-    event_value_cr: float = 0.0
-    market_cap_cr:  float | None = None
-    _lock:          threading.Lock = field(default_factory=threading.Lock, repr=False)
+    event_value_cr:    float = 0.0
+    market_cap_cr:     float | None = None
+    industry:          str = ""
+    rsi:               float | None = None
+    queued_off_market: bool = False
+    _lock:             threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 # ─── Live tracker ─────────────────────────────────────────────────────────────
@@ -85,15 +89,17 @@ class TradeState:
 class LiveTracker:
     """Thread-safe live paper-trading engine."""
 
-    def __init__(self) -> None:
+    def __init__(self, client_id: str, access_token: str) -> None:
+        self._client_id   = client_id
+        self._access_token = access_token
         self._trades:    dict[str, TradeState] = {}   # fyers_symbol → state
         self._trades_lock = threading.Lock()
         self._ws:        data_ws.FyersDataSocket | None = None
         self._ws_authed  = threading.Event()           # set after auth success
 
         self._fyers = fyersModel.FyersModel(
-            client_id=FYERS_CLIENT_ID,
-            token=FYERS_ACCESS_TOKEN,
+            client_id=client_id,
+            token=access_token,
             log_path=FYERS_LOG_PATH,
         )
 
@@ -104,7 +110,7 @@ class LiveTracker:
         log.info("─── Starting Fyers WebSocket ───")
         # write_to_file=True makes the WS thread a daemon so main() can run the HTTP loop
         self._ws = data_ws.FyersDataSocket(
-            access_token=f"{FYERS_CLIENT_ID}:{FYERS_ACCESS_TOKEN}",
+            access_token=f"{self._client_id}:{self._access_token}",
             log_path=FYERS_LOG_PATH,
             write_to_file=True,
             on_message=self._on_message,
@@ -189,42 +195,48 @@ class LiveTracker:
                     state.day_open = open_px
                     log.info("[%s] day_open = ₹%.2f", state.fyers_symbol, open_px)
 
+                    # Gap filter: if queued off-market and stock already gapped ≥3%, news is priced in
+                    if state.queued_off_market and state.status == WAITING_ENTRY:
+                        prev_close = msg.get("prev_close_price")
+                        if prev_close and prev_close > 0:
+                            gap_pct = (open_px - prev_close) / prev_close * 100
+                            if gap_pct >= 3.0:
+                                state.status = EXITED
+                                database.update_trade(state.trade_id, {
+                                    "status":      EXITED,
+                                    "exit_reason": f"GAP_TOO_LARGE ({gap_pct:.1f}%)",
+                                    "exit_time":   datetime.now(IST).isoformat(),
+                                })
+                                log.info(
+                                    "[%s] GAP_TOO_LARGE %.1f%% vs prev_close ₹%.2f — expired",
+                                    state.fyers_symbol, gap_pct, prev_close,
+                                )
+                                if self._ws:
+                                    try:
+                                        self._ws.unsubscribe([state.fyers_symbol])
+                                    except Exception as exc:
+                                        log.warning("Unsubscribe failed for %s: %s", state.fyers_symbol, exc)
+                                return
+
             # ── WAITING_ENTRY: watch for entry trigger ────────────────────────
             if state.status == WAITING_ENTRY and state.day_open:
-                if state.direction == "BUY":
-                    trigger = state.day_open * (1 + _LIVE_ENTRY_MIN)
-                    if ltp >= trigger and ltp > state.day_open:
-                        self._enter(state, ltp)
-                elif state.direction == "SHORT":
-                    trigger = state.day_open * (1 - _LIVE_ENTRY_MIN)
-                    if ltp <= trigger and ltp < state.day_open:
-                        self._enter(state, ltp)
+                trigger = state.day_open * (1 + _LIVE_ENTRY_MIN)
+                if ltp >= trigger and ltp > state.day_open:
+                    self._enter(state, ltp)
 
             # ── ENTERED: check TP / SL / time ─────────────────────────────────
             elif state.status == ENTERED:
                 elapsed_min = (time.time() - state.entry_ts) / 60.0
 
-                if state.direction == "BUY":
-                    if ltp >= state.tp:
-                        self._exit(state, ltp, "TAKE_PROFIT")
-                        return
-                    if ltp <= state.sl:
-                        self._exit(state, ltp, "STOP_LOSS")
-                        return
-                    if elapsed_min >= 5 and ltp < state.hold_price:
-                        self._exit(state, ltp, "TIME_EXIT_5MIN")
-                        return
-
-                elif state.direction == "SHORT":
-                    if ltp <= state.tp:        # tp is lower for short
-                        self._exit(state, ltp, "TAKE_PROFIT")
-                        return
-                    if ltp >= state.sl:        # sl is higher for short
-                        self._exit(state, ltp, "STOP_LOSS")
-                        return
-                    if elapsed_min >= 5 and ltp > state.hold_price:
-                        self._exit(state, ltp, "TIME_EXIT_5MIN")
-                        return
+                if ltp >= state.tp:
+                    self._exit(state, ltp, "TAKE_PROFIT")
+                    return
+                if ltp <= state.sl:
+                    self._exit(state, ltp, "STOP_LOSS")
+                    return
+                if elapsed_min >= 5 and ltp < state.hold_price:
+                    self._exit(state, ltp, "TIME_EXIT_5MIN")
+                    return
 
                 # Hard time-based exit
                 if elapsed_min >= _LIVE_FINAL_EXIT:
@@ -232,16 +244,13 @@ class LiveTracker:
 
     def _enter(self, state: TradeState, ltp: float) -> None:
         """Record entry; set TP / SL / hold targets."""
-        tp_pct = _LIVE_TP * (0.8 if state.score < _SCORE_HIGH_CONV else 1.0)
+        is_high_conv = state.score >= _SCORE_HIGH_CONV
+        tp_pct = _LIVE_TP * (1.0 if is_high_conv else 0.8)
+        sl_pct = _LIVE_SL_HIGH if is_high_conv else _LIVE_SL
 
-        if state.direction == "BUY":
-            state.tp         = ltp * (1 + tp_pct)
-            state.sl         = ltp * (1 - _LIVE_SL)
-            state.hold_price = ltp * (1 + _LIVE_HOLD_MIN)
-        else:   # SHORT
-            state.tp         = ltp * (1 - tp_pct)
-            state.sl         = ltp * (1 + _LIVE_SL)
-            state.hold_price = ltp * (1 - _LIVE_HOLD_MIN)
+        state.tp         = ltp * (1 + tp_pct)
+        state.sl         = ltp * (1 - sl_pct)
+        state.hold_price = ltp * (1 + _LIVE_HOLD_MIN)
 
         state.entry_price = ltp
         state.entry_ts    = time.time()
@@ -264,14 +273,14 @@ class LiveTracker:
             entry_time_str=state.entry_time.strftime("%H:%M:%S"),
             event_value_cr=state.event_value_cr or None,
             market_cap_cr=state.market_cap_cr,
+            industry=state.industry or None,
+            rsi=state.rsi,
+            score=state.score,
         )
 
     def _exit(self, state: TradeState, ltp: float, reason: str) -> None:
         """Record exit; persist to DB; send Telegram; unsubscribe."""
-        if state.direction == "BUY":
-            pnl_pct = (ltp - state.entry_price) / state.entry_price * 100
-        else:
-            pnl_pct = (state.entry_price - ltp) / state.entry_price * 100
+        pnl_pct = (ltp - state.entry_price) / state.entry_price * 100
 
         state.status   = EXITED
         exit_time      = datetime.now(IST)
@@ -289,17 +298,31 @@ class LiveTracker:
             state.fyers_symbol, state.direction, ltp, sign, pnl_pct, reason,
         )
 
+        entry_time_str = state.entry_time.strftime("%H:%M:%S") if state.entry_time else None
+        exit_time_str  = exit_time.strftime("%H:%M:%S")
+        duration_min   = (time.time() - state.entry_ts) / 60.0 if state.entry_ts else 0.0
+
         # Route time-based exits to a distinct Telegram message
         is_time_exit = "TIME_EXIT" in reason or "HARD_EXIT" in reason or "MARKET_CLOSE" in reason
         if is_time_exit:
             telegram_manager.send_time_exit(
                 state.company_name, state.fyers_symbol, state.order_type,
-                state.direction, state.entry_price, ltp, pnl_pct, reason,
+                state.entry_price, ltp, pnl_pct, reason,
+                entry_time_str=entry_time_str,
+                exit_time_str=exit_time_str,
+                duration_min=duration_min,
+                event_value_cr=state.event_value_cr,
+                market_cap_cr=state.market_cap_cr,
             )
         else:
             telegram_manager.send_exit(
                 state.company_name, state.fyers_symbol, state.order_type,
-                state.direction, state.entry_price, ltp, pnl_pct, reason,
+                state.entry_price, ltp, pnl_pct, reason,
+                entry_time_str=entry_time_str,
+                exit_time_str=exit_time_str,
+                duration_min=duration_min,
+                event_value_cr=state.event_value_cr,
+                market_cap_cr=state.market_cap_cr,
             )
 
         # Unsubscribe from websocket
@@ -329,6 +352,9 @@ class LiveTracker:
         notif_date = notification.get("date", "")
         order_type = notification.get("order_type", "UNKNOWN")
         order_val  = float(notification.get("order_value_cr", 0.0))
+        alfa_reason = bool(notification.get("alfa_reason", ""))
+        qoq_raw     = notification.get("qoq_growth")
+        profit_growth_qoq = float(qoq_raw) if qoq_raw is not None else None
 
         log.info(
             "─── Notification  company=%s  symbol=%s  isin=%s  date=%s  type=%s ───",
@@ -376,7 +402,11 @@ class LiveTracker:
         row = trendlyne_manager.get_by_isin(resolved_isin)
         if not row and raw_symbol:
             row = trendlyne_manager.get_by_symbol(raw_symbol)
-        ev = _build_event_data(row, order_value_cr=order_val)
+        if not row:
+            log.warning("[GUARD] No Trendlyne data for %s (%s) — skipping", company, fyers_sym)
+            _db_skip(resolved_isin, fyers_sym, company, raw_symbol, order_type, "NO_TRENDLYNE_DATA")
+            return
+        ev = _build_event_data(row, order_value_cr=order_val, alfa_reason=alfa_reason, profit_growth_qoq=profit_growth_qoq)
 
         # ── Off-market gate: only track if event ≥ 50% of market cap ─────────
         if not is_market_open:
@@ -397,7 +427,10 @@ class LiveTracker:
         if skip:
             log.info("SKIP [%s] %s: %s", fyers_sym, company, skip_reason)
             _db_skip(resolved_isin, fyers_sym, company, raw_symbol, order_type, skip_reason)
-            telegram_manager.send_skip(company, fyers_sym, resolved_isin, order_type, skip_reason)
+            telegram_manager.send_skip(
+                company, fyers_sym, resolved_isin, order_type, skip_reason,
+                order_value_cr=order_val, market_cap_cr=ev.market_cap_cr, industry=ev.industry or None,
+            )
             return
 
         # ── Score ─────────────────────────────────────────────────────────────
@@ -407,7 +440,10 @@ class LiveTracker:
             log.info("SKIP [%s] %s: %s", fyers_sym, company, skip_reason)
             _db_skip(resolved_isin, fyers_sym, company, raw_symbol, order_type, skip_reason,
                      confidence_score=score)
-            telegram_manager.send_skip(company, fyers_sym, resolved_isin, order_type, skip_reason)
+            telegram_manager.send_skip(
+                company, fyers_sym, resolved_isin, order_type, skip_reason,
+                order_value_cr=order_val, market_cap_cr=ev.market_cap_cr, industry=ev.industry or None,
+            )
             return
 
         # ── Insert DB record ──────────────────────────────────────────────────
@@ -444,6 +480,9 @@ class LiveTracker:
             notif_time=notif_dt,
             event_value_cr=order_val,
             market_cap_cr=ev.market_cap_cr,
+            industry=ev.industry or "",
+            rsi=ev.rsi,
+            queued_off_market=not is_market_open,
         )
 
         with self._trades_lock:
@@ -468,9 +507,11 @@ class LiveTracker:
             fyers_sym, company, direction, score, ref_price,
             " [OFF-MARKET]" if not is_market_open else "",
         )
+        conviction = "HIGH" if score >= _SCORE_HIGH_CONV else "NORMAL"
         telegram_manager.send_tracking(
             company, fyers_sym, resolved_isin, order_type,
             direction, score, ref_price,
+            conviction=conviction,
             event_value_cr=order_val or None,
             market_cap_cr=ev.market_cap_cr,
             order_impact_pct=ev.order_impact_pct or None,
@@ -567,8 +608,13 @@ def _db_skip(
     })
 
 
-def _build_event_data(row: dict | None, order_value_cr: float = 0.0) -> EventData:
-    """Build EventData from a Trendlyne CSV row; all fields are optional."""
+def _build_event_data(
+    row: dict | None,
+    order_value_cr: float = 0.0,
+    alfa_reason: bool = False,
+    profit_growth_qoq: float | None = None,
+) -> EventData:
+    """Build EventData from a Trendlyne CSV row + notification payload fields."""
 
     def _f(key: str) -> float | None:
         try:
@@ -582,14 +628,16 @@ def _build_event_data(row: dict | None, order_value_cr: float = 0.0) -> EventDat
         return int(v) if v is not None else None
 
     return EventData(
-        order_value_cr = order_value_cr,
-        market_cap_cr  = _f("Market Capitalization"),
-        rsi            = _f("Day RSI"),
-        day_chg_pct    = _f("Day change %"),
-        week_chg_pct   = _f("Week change %"),
-        month_chg_pct  = _f("Month Change %"),
-        vol_week_avg   = _i("Week Volume Avg"),
-        vol_month_avg  = _i("Month Volume Avg"),
-        price_15s_pct  = None,  # not available before entry — scored without it
-        industry       = (row or {}).get("Industry Name", ""),
+        order_value_cr    = order_value_cr,
+        market_cap_cr     = _f("Market Capitalization"),
+        rsi               = _f("Day RSI"),
+        day_chg_pct       = _f("Day change %"),
+        week_chg_pct      = _f("Week change %"),
+        month_chg_pct     = _f("Month Change %"),
+        vol_week_avg      = _i("Week Volume Avg"),
+        vol_month_avg     = _i("Month Volume Avg"),
+        price_15s_pct     = None,
+        industry          = (row or {}).get("Industry Name", ""),
+        alfa_reason       = alfa_reason,
+        profit_growth_qoq = profit_growth_qoq,
     )
