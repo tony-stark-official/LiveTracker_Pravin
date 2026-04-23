@@ -75,26 +75,31 @@ _tracker_lock  = threading.Lock()
 # ── Force-exit scheduler ──────────────────────────────────────────────────────
 
 def _market_close_watcher(tracker) -> None:
-    """Background thread: force-exits all entered trades at 15:25 IST on trading days."""
+    """
+    Background thread: force-exits all trades at 15:25 IST, disconnects WebSocket,
+    sends Telegram summary, then exits the process cleanly.
+    Next day the process is restarted by cron/systemd — fresh token, clean slate.
+    """
     CLOSE_HOUR, CLOSE_MIN = 15, 25
-    triggered = False
     while True:
         now = datetime.now(IST)
         is_trading_day = now.weekday() < 5  # Mon–Fri only
         if is_trading_day and (now.hour > CLOSE_HOUR or (now.hour == CLOSE_HOUR and now.minute >= CLOSE_MIN)):
-            if not triggered:
-                log.info("─── Market close: force-exiting all active trades ───")
-                triggered = True
-                tracker.force_exit_all("MARKET_CLOSE")
-                summary = tracker.get_status_summary()
-                telegram_manager.send_system(
-                    f"Market closed (15:25 IST).\n"
-                    f"Trades today → entered: {summary['entered']}  "
-                    f"exited: {summary['exited']}  "
-                    f"expired: {summary['waiting']}  skip: {summary['skip']}"
-                )
-        else:
-            triggered = False  # reset for next day
+            log.info("─── 15:25 IST: closing all trades and disconnecting ───")
+            tracker.force_exit_all("MARKET_CLOSE")
+            summary = tracker.get_status_summary()
+            telegram_manager.send_system(
+                f"Market closed (15:25 IST).\n"
+                f"Trades today → entered: {summary['entered']}  "
+                f"exited: {summary['exited']}  "
+                f"expired: {summary['waiting']}  skip: {summary['skip']}\n"
+                f"Shutting down — will restart tomorrow at 08:00."
+            )
+            tracker.stop()
+            log.info("WebSocket disconnected. Token cleared. Exiting for the day.")
+            import os as _os
+            _os.kill(_os.getpid(), signal.SIGTERM)
+            return
         time.sleep(30)
 
 

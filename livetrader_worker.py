@@ -51,6 +51,10 @@ from dotenv import load_dotenv
 # Load from .env.livetrader in the same directory as this file
 load_dotenv(Path(__file__).parent / ".env.livetrader")
 
+# Ensure the parent directory is on sys.path so LiveTrader package imports work
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # ── Config ────────────────────────────────────────────────────────────────────
 WORKER_PORT    = int(os.getenv("LIVETRADER_WORKER_PORT", "8769"))
 WORKER_SECRET  = os.getenv("LIVETRADER_WORKER_SECRET", "")
@@ -62,8 +66,6 @@ FYERS_REDIRECT_URI = os.getenv("FYERS_REDIRECT_URI", "")
 FYERS_MOBILE      = os.getenv("FYERS_MOBILE", "")
 FYERS_PIN         = os.getenv("FYERS_PIN", "")
 FYERS_TOTP_KEY    = os.getenv("FYERS_TOTP_KEY", "")
-
-FYERS_DB_PATH = str(Path(__file__).parent / "livetrader_fyers.db")
 
 _LOGIN_MAX_ATTEMPTS = 3   # outer retry loop (each attempt is itself 3 tries inside FyersAuthManager)
 _RETRY_WAIT_SECONDS = 30  # wait between outer attempts
@@ -82,6 +84,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("livetrader_worker")
 
+# ── Minimal token DB stub (no persistence needed on the Windows worker side) ──
+
+class _TokenDB:
+    def delete_token(self): pass
+    def save_token(self, token: str): pass
+
+
 # ── State ─────────────────────────────────────────────────────────────────────
 _last_token: str | None = None          # most recent token obtained
 _login_in_progress = threading.Lock()   # prevent overlapping logins
@@ -90,12 +99,6 @@ _login_status = {"state": "idle", "error": ""}  # for /status endpoint
 
 # ── Fyers login ───────────────────────────────────────────────────────────────
 
-def _import_fyers():
-    from project.fyers.database import FyersDB
-    from project.fyers.auth import FyersAuthManager
-    return FyersDB, FyersAuthManager
-
-
 def _run_fyers_login() -> str | None:
     """
     Run SeleniumBase Fyers browser login for Pravin's account.
@@ -103,16 +106,15 @@ def _run_fyers_login() -> str | None:
     Outer loop retries _LOGIN_MAX_ATTEMPTS times.
     """
     try:
-        FyersDB, FyersAuthManager = _import_fyers()
+        from LiveTrader.auth import FyersAuthManager
     except ImportError as exc:
         log.error("[FYERS] Cannot import FyersAuthManager: %s", exc)
         _login_status["state"] = "failed"
         _login_status["error"] = str(exc)
         return None
 
-    db = FyersDB(FYERS_DB_PATH)
     auth = FyersAuthManager(
-        db=db,
+        db=_TokenDB(),
         app_id=FYERS_APP_ID,
         secret_id=FYERS_SECRET_ID,
         redirect_uri=FYERS_REDIRECT_URI,
